@@ -63,7 +63,11 @@ export default {
 
                 try {
                     // Range vai para o Drive; a resposta 206 volta com Content-Range.
-                    const range = request.headers.get("Range");
+                    // Multi-range (`bytes=0-99,200-299`) fica de fora: o Drive responde
+                    // multipart/byteranges e o Content-Range nao descreve a fatia inteira,
+                    // entao Content-Length sairia errado. Serve o arquivo inteiro.
+                    const rawRange = request.headers.get("Range");
+                    const range = rawRange && !rawRange.includes(",") ? rawRange : null;
                     const fileStream = await streamDownloadFromDrive(accessToken, bucket, objectKey, env, range);
 
                     if (fileStream.status === 416) {
@@ -89,6 +93,8 @@ export default {
                             "Content-Length",
                             match ? String(Number(match[2]) - Number(match[1]) + 1) : fileStream.size.toString(),
                         );
+                        // Fatia parcial em cache de borda serve range no lugar do arquivo.
+                        headers.set("Cache-Control", "no-store");
                     } else {
                         headers.set("Content-Length", fileStream.size.toString());
                     }
@@ -396,7 +402,13 @@ async function streamDownloadFromDrive(
         headers.Range = range;
     }
 
-    const downloadRes = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`, { headers });
+    // Sem o abort de 5 s original: o Drive pode demorar a primeira resposta de um
+    // arquivo grande. O limite fica só na fase de headers (60 s); depois disso o corpo
+    // continua em stream, sem prazo.
+    const downloadRes = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`, {
+        headers,
+        signal: AbortSignal.timeout(60_000),
+    });
 
     if (downloadRes.status === 416) {
         return {
