@@ -62,17 +62,38 @@ export default {
                 }
 
                 try {
-                    const fileStream = await streamDownloadFromDrive(accessToken, bucket, objectKey, env);
+                    // Range vai para o Drive; a resposta 206 volta com Content-Range.
+                    const range = request.headers.get("Range");
+                    const fileStream = await streamDownloadFromDrive(accessToken, bucket, objectKey, env, range);
 
-                    return new Response(fileStream.body, {
-                        status: 200,
-                        headers: {
-                            "Content-Type": fileStream.contentType,
-                            "Content-Length": fileStream.size.toString(),
-                            "Cache-Control": "s-maxage=300, no-store",
-                            ETag: `"${fileStream.id}"`,
-                        },
+                    if (fileStream.status === 416) {
+                        return new Response(null, {
+                            status: 416,
+                            headers: {
+                                "Content-Range": fileStream.contentRange ?? `bytes */${fileStream.size}`,
+                                "Accept-Ranges": "bytes",
+                            },
+                        });
+                    }
+
+                    const headers = new Headers({
+                        "Content-Type": fileStream.contentType,
+                        "Accept-Ranges": "bytes",
+                        "Cache-Control": "s-maxage=300, no-store",
+                        ETag: `"${fileStream.id}"`,
                     });
+                    if (fileStream.status === 206 && fileStream.contentRange) {
+                        headers.set("Content-Range", fileStream.contentRange);
+                        const match = /bytes\s+(\d+)-(\d+)\/(\d+)/.exec(fileStream.contentRange);
+                        headers.set(
+                            "Content-Length",
+                            match ? String(Number(match[2]) - Number(match[1]) + 1) : fileStream.size.toString(),
+                        );
+                    } else {
+                        headers.set("Content-Length", fileStream.size.toString());
+                    }
+
+                    return new Response(fileStream.body, { status: fileStream.status, headers });
                 } catch (e) {
                     const error = e as Error;
                     if (error.message === "File not found") {
@@ -109,6 +130,7 @@ export default {
                         headers: {
                             "Content-Type": metadata.mimeType,
                             "Content-Length": metadata.size.toString(),
+                            "Accept-Ranges": "bytes",
                             ETag: `"${metadata.id}"`,
                         },
                     });
@@ -346,7 +368,20 @@ async function findFileInFolder(accessToken: string, folderId: string, fileName:
     return data.files && data.files.length > 0 ? data.files[0] : null;
 }
 
-async function streamDownloadFromDrive(accessToken: string, bucket: string, objectKey: string, env: Env): Promise<{ body: ReadableStream; contentType: string; size: number; id: string }> {
+async function streamDownloadFromDrive(
+    accessToken: string,
+    bucket: string,
+    objectKey: string,
+    env: Env,
+    range?: string | null,
+): Promise<{
+    body: ReadableStream | null;
+    contentType: string;
+    size: number;
+    id: string;
+    status: number;
+    contentRange: string | null;
+}> {
     const { parentFolderId, fileName } = await resolvePathToFolderAndFile(accessToken, bucket, objectKey, env);
     const file = await findFileInFolder(accessToken, parentFolderId, fileName);
 
@@ -354,17 +389,25 @@ async function streamDownloadFromDrive(accessToken: string, bucket: string, obje
         throw new Error("File not found");
     }
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => {
-        controller.abort();
-    }, 5000);
+    // Sem AbortController de 5 s: o Drive pode demorar a primeira resposta de um
+    // arquivo grande, e o corpo continua em stream depois dos headers.
+    const headers: Record<string, string> = { Authorization: `Bearer ${accessToken}` };
+    if (range) {
+        headers.Range = range;
+    }
 
-    const downloadRes = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`, {
-        headers: { Authorization: `Bearer ${accessToken}` },
-        signal: controller.signal,
-    });
+    const downloadRes = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`, { headers });
 
-    clearTimeout(timeout);
+    if (downloadRes.status === 416) {
+        return {
+            body: null,
+            contentType: file.mimeType || "application/octet-stream",
+            size: parseInt(file.size || "0"),
+            id: file.id,
+            status: 416,
+            contentRange: downloadRes.headers.get("Content-Range"),
+        };
+    }
 
     if (!downloadRes.ok) {
         console.error(downloadRes.status);
@@ -377,6 +420,8 @@ async function streamDownloadFromDrive(accessToken: string, bucket: string, obje
         contentType: file.mimeType || "application/octet-stream",
         size: parseInt(file.size || "0"),
         id: file.id,
+        status: downloadRes.status,
+        contentRange: downloadRes.headers.get("Content-Range"),
     };
 }
 
